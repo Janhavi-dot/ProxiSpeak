@@ -1,0 +1,174 @@
+
+.proximity-panel {
+  margin-top: 18px;
+  padding: 16px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 10px;
+}
+
+.proximity-panel h3 {
+  margin: 0 0 10px;
+  color: #166534;
+}
+
+.proximity-panel p {
+  color: #64748b;
+  margin-bottom: 0;
+}
+
+.proximity-panel ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.proximity-panel li {
+  margin: 8px 0;
+}
+
+.nearby-indicator {
+  color: #16a34a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #f1f5f9;
+  color: #172033;
+}
+
+.app {
+  width: min(1050px, 95%);
+  margin: 35px auto;
+}
+
+.hero {
+  text-align: center;
+  margin-bottom: 28px;
+}
+
+.eyebrow {
+  color: #4f46e5;
+  font-weight: bold;
+  letter-spacing: 2px;
+  font-size: 12px;
+}
+
+h1 {
+  margin: 12px 0;
+  font-size: 46px;
+}
+
+.hero p:last-child {
+  color: #64748b;
+}
+
+.office {
+  padding: 24px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.05);
+}
+
+.office-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.office-title h2 {
+  margin: 0 0 6px;
+}
+
+.office-title p {
+  margin: 0;
+  color: #64748b;
+}
+
+.online,
+.offline {
+  padding: 8px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.online {
+  color: #166534;
+  background: #dcfce7;
+}
+
+.offline {
+  color: #991b1b;
+  background: #fee2e2;
+}
+
+.connection-error {
+  color: #991b1b;
+  background: #fef2f2;
+  padding: 10px;
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+
+.canvas-container {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.stats span {
+  background: #eef2ff;
+  color: #3730a3;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.instructions {
+  margin-bottom: 0;
+  padding: 16px;
+  background: #f8fafc;
+  color: #64748b;
+  border-radius: 10px;
+  line-height: 1.6;
+}
+
+@media (max-width: 600px) {
+  .app {
+    margin: 20px auto;
+  }
+
+  .office {
+    padding: 12px;
+  }
+
+  h1 {
+    font-size: 36px;
+  }
+
+  canvas {
+    min-width: 600px;
+  }
+}
