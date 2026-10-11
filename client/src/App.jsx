@@ -1,308 +1,280 @@
-
-import { useEffect, useRef, useState } from "react";
-import { io } from "socket.io-client";
+import { useState, useEffect, useCallback } from "react";
+import { AuthProvider } from "./context/AuthContext.jsx";
+import { Navbar } from "./components/Navbar.jsx";
+import { OfficeCanvas } from "./components/OfficeCanvas.jsx";
+import { CoworkersPanel } from "./components/CoworkersPanel.jsx";
+import { AuthModal } from "./components/AuthModal.jsx";
+import { AudioBroadcastModal } from "./components/AudioBroadcastModal.jsx";
+import { getSocket, emitOfficeMove } from "./services/socket.js";
+import { webrtc } from "./services/webrtc.js";
+import { spatialMixer } from "./services/spatialAudio.js";
+import { api } from "./services/api.js";
 import "./App.css";
 
-const WIDTH = 900;
-const HEIGHT = 500;
-const SPEED = 3;
-const API_URL = "http://localhost:5000";
-const HEARING_RADIUS = 100;
+function ProxiSpeakMain() {
+  // Virtual Corporate Office Coordinates (Normalized 1000 x 750 architectural space)
+  const [officePos, setOfficePos] = useState({
+    x: 220,
+    y: 190,
+    zone: "Modern Reception Lobby",
+  });
+  const [targetPos, setTargetPos] = useState(null);
 
-function App() {
-  const canvasRef = useRef(null);
-  const position = useRef({ x: 180, y: 180 });
-  const keys = useRef({});
-  const remoteUsers = useRef(new Map());
+  // Earshot Proximity Radius (Standard 100px as defined in Infotact Project 2)
+  const [radius, setRadius] = useState(100);
 
-  const [connection, setConnection] = useState("Connecting...");
-  const [connectionError, setConnectionError] = useState("");
-  const [userCount, setUserCount] = useState(1);
-  const [coordinates, setCoordinates] = useState({ x: 180, y: 180 });
-  const [nearbyUsers, setNearbyUsers] = useState([]);
+  // WebRTC Audio & Microphone Controls
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isDeafened, setIsDeafened] = useState(false);
+  const [isSpatialAudio, setIsSpatialAudio] = useState(true);
+  const [isOcclusionEnabled, setIsOcclusionEnabled] = useState(true);
 
+  // Live Socket & Peers State
+  const [isLiveTracking, setIsLiveTracking] = useState(true);
+  const [livePeers, setLivePeers] = useState([]);
+  const [liveUsersCount, setLiveUsersCount] = useState(1);
+
+  // Anchored Spatial Audio Beacons on Office Desks
+  const [beacons, setBeacons] = useState([]);
+  const [isBroadcastOpen, setIsBroadcastOpen] = useState(false);
+
+  // Modal Dialogs
+  const [isAuthOpen, setIsAuthOpen] = useState(false);
+
+  // 1. Initial Office Presence Broadcast & WebRTC Setup
   useEffect(() => {
-    const socket = io(API_URL, {
-      transports: ["websocket", "polling"],
-      reconnection: true,
-      reconnectionAttempts: 10,
-      reconnectionDelay: 1000,
-      timeout: 10000,
-    });
+    emitOfficeMove({ x: 220, y: 190, zone: "Modern Reception Lobby", radius: 100 });
 
-    socket.on("connect", () => {
-      console.log("Socket.io connected:", socket.id);
-      setConnection("Connected");
-      setConnectionError("");
-    });
-
-    socket.on("connect_error", (error) => {
-      console.error("Socket.io connection error:", error.message);
-      setConnection("Connection failed");
-      setConnectionError(error.message);
-    });
-
-    socket.on("disconnect", (reason) => {
-      console.warn("Socket.io disconnected:", reason);
-      setConnection("Disconnected");
-    });
-
-    socket.on("users:update", (users) => {
-      remoteUsers.current.clear();
-
-      users.forEach((user) => {
-        if (user.id !== socket.id) {
-          remoteUsers.current.set(user.id, user);
+    // Load active spatial audio beacons on floor
+    const loadBeacons = async () => {
+      try {
+        const res = await api.audio.getNearby({ x: 220, y: 190, radius: 1000 });
+        if (res.audios) {
+          setBeacons(res.audios);
         }
-      });
-
-      setUserCount(remoteUsers.current.size + 1);
-    });
-
-    socket.on("user:joined", (user) => {
-      if (user.id !== socket.id) {
-        remoteUsers.current.set(user.id, user);
-        setUserCount(remoteUsers.current.size + 1);
+      } catch (err) {
+        console.warn("Could not load initial audio beacons:", err);
       }
-    });
+    };
+    loadBeacons();
 
-    // Update other users' positions.
-    socket.on("player:moved", (data) => {
-      const user = remoteUsers.current.get(data.id);
+    // Initialize WebRTC mic analyser
+    webrtc.onSpeakingChange = (speaking) => {
+      setIsSpeaking(speaking);
+    };
 
-      if (user) {
-        user.x = data.x;
-        user.y = data.y;
-      }
-    });
-
-    // Receive the list of nearby users from the backend.
-    socket.on("proximity:update", (users) => {
-      setNearbyUsers(users);
-    });
-
-    socket.on("user:left", (id) => {
-      remoteUsers.current.delete(id);
-      setUserCount(remoteUsers.current.size + 1);
-    });
-
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
-
-    let animationId;
-    let lastPositionUpdate = 0;
-    let lastUIUpdate = 0;
-
-    function handleKeyDown(event) {
-      const key = event.key.toLowerCase();
-
-      if (
-        ["arrowup", "arrowdown", "arrowleft", "arrowright",
-          "w", "a", "s", "d"].includes(key)
-      ) {
-        event.preventDefault();
-        keys.current[key] = true;
-      }
-    }
-
-    function handleKeyUp(event) {
-      keys.current[event.key.toLowerCase()] = false;
-    }
-
-    function drawDesk(x, y, label) {
-      ctx.fillStyle = "#cbd5e1";
-      ctx.fillRect(x, y, 120, 55);
-
-      ctx.fillStyle = "#475569";
-      ctx.font = "13px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText(label, x + 60, y + 32);
-    }
-
-    function drawAvatar(x, y, name, color) {
-      ctx.beginPath();
-      ctx.arc(x, y, 16, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
-
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = "#ffffff";
-      ctx.stroke();
-
-      ctx.fillStyle = "#172033";
-      ctx.font = "bold 12px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText(name, x, y - 25);
-    }
-
-    function drawOffice() {
-      const p = position.current;
-      const k = keys.current;
-
-      if (k.arrowup || k.w) p.y -= SPEED;
-      if (k.arrowdown || k.s) p.y += SPEED;
-      if (k.arrowleft || k.a) p.x -= SPEED;
-      if (k.arrowright || k.d) p.x += SPEED;
-
-      p.x = Math.max(20, Math.min(WIDTH - 20, p.x));
-      p.y = Math.max(20, Math.min(HEIGHT - 20, p.y));
-
-      // Office floor and grid.
-      ctx.fillStyle = "#f8fafc";
-      ctx.fillRect(0, 0, WIDTH, HEIGHT);
-
-      ctx.strokeStyle = "#e2e8f0";
-      ctx.lineWidth = 1;
-
-      for (let x = 0; x <= WIDTH; x += 40) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, HEIGHT);
-        ctx.stroke();
-      }
-
-      for (let y = 0; y <= HEIGHT; y += 40) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(WIDTH, y);
-        ctx.stroke();
-      }
-
-      // Office desks.
-      drawDesk(60, 60, "Desk 1");
-      drawDesk(350, 60, "Desk 2");
-      drawDesk(650, 60, "Desk 3");
-      drawDesk(60, 380, "Desk 4");
-      drawDesk(650, 380, "Desk 5");
-
-      // Meeting area.
-      ctx.fillStyle = "#d1fae5";
-      ctx.fillRect(370, 350, 150, 70);
-
-      ctx.fillStyle = "#065f46";
-      ctx.font = "13px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText("Meeting Area", 445, 390);
-
-      // Hearing radius.
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, HEARING_RADIUS, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(79, 70, 229, 0.08)";
-      ctx.fill();
-
-      ctx.strokeStyle = "#818cf8";
-      ctx.setLineDash([6, 5]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Other users.
-      for (const user of remoteUsers.current.values()) {
-        drawAvatar(user.x, user.y, user.name, "#0d9488");
-      }
-
-      // Your avatar.
-      drawAvatar(p.x, p.y, "You", "#4f46e5");
-
-      const now = performance.now();
-
-      // Send your position to the backend.
-      if (socket.connected && now - lastPositionUpdate >= 50) {
-        socket.emit("player:move", { x: p.x, y: p.y });
-        lastPositionUpdate = now;
-      }
-
-      // Update the displayed coordinates.
-      if (now - lastUIUpdate >= 100) {
-        setCoordinates({
-          x: Math.round(p.x),
-          y: Math.round(p.y),
-        });
-
-        lastUIUpdate = now;
-      }
-
-      animationId = requestAnimationFrame(drawOffice);
-    }
-
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-
-    drawOffice();
+    // Auto-request local microphone on first user gesture or mount
+    const handleFirstGesture = () => {
+      webrtc.initLocalMicrophone();
+      window.removeEventListener("click", handleFirstGesture);
+      window.removeEventListener("keydown", handleFirstGesture);
+    };
+    window.addEventListener("click", handleFirstGesture);
+    window.addEventListener("keydown", handleFirstGesture);
 
     return () => {
-      cancelAnimationFrame(animationId);
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-      socket.disconnect();
+      window.removeEventListener("click", handleFirstGesture);
+      window.removeEventListener("keydown", handleFirstGesture);
     };
   }, []);
 
+  // 2. Real-time Office Movement Handler
+  const handleUserMove = useCallback((pos) => {
+    setOfficePos(pos);
+    if (isLiveTracking) {
+      emitOfficeMove({ ...pos, radius });
+    }
+  }, [isLiveTracking, radius]);
+
+  // 3. Socket.IO Real-time Events
+  useEffect(() => {
+    const socket = getSocket();
+
+    socket.on("live:count", (count) => {
+      setLiveUsersCount(count || 1);
+    });
+
+    socket.on("proximity:peers", (peers) => {
+      setLivePeers(peers || []);
+    });
+
+    socket.on("peer:moved", (peer) => {
+      setLivePeers((prev) => {
+        const index = prev.findIndex((p) => p.id === peer.id);
+        if (index >= 0) {
+          const updated = [...prev];
+          updated[index] = { ...updated[index], ...peer };
+          return updated;
+        }
+        return [...prev, peer];
+      });
+    });
+
+    socket.on("peer:speaking", ({ id, isSpeaking: speaking }) => {
+      setLivePeers((prev) => {
+        const index = prev.findIndex((p) => p.id === id);
+        if (index >= 0) {
+          const updated = [...prev];
+          updated[index] = { ...updated[index], isSpeaking: speaking };
+          return updated;
+        }
+        return prev;
+      });
+    });
+
+    socket.on("user:left", (leftId) => {
+      setLivePeers((prev) => prev.filter((p) => p.id !== leftId));
+    });
+
+    socket.on("audio:created", (newAudio) => {
+      setBeacons((prev) => {
+        const id = newAudio.id || newAudio._id;
+        const exists = prev.some((b) => (b.id || b._id) === id);
+        if (exists) return prev;
+        return [newAudio, ...prev];
+      });
+    });
+
+    socket.on("audio:deleted", ({ id }) => {
+      setBeacons((prev) => prev.filter((b) => (b.id || b._id) !== id));
+    });
+
+    return () => {
+      socket.off("live:count");
+      socket.off("proximity:peers");
+      socket.off("peer:moved");
+      socket.off("peer:speaking");
+      socket.off("user:left");
+      socket.off("audio:created");
+      socket.off("audio:deleted");
+    };
+  }, []);
+
+  // 4. Dynamic Proximity Spatial Audio Mixer for Anchored Beacons
+  useEffect(() => {
+    spatialMixer.syncBeacons(beacons, officePos.x, officePos.y, radius);
+  }, [beacons, officePos, radius]);
+
+  const handleBroadcastCreated = (newAudio) => {
+    setBeacons((prev) => {
+      const id = newAudio.id || newAudio._id;
+      const exists = prev.some((b) => (b.id || b._id) === id);
+      if (exists) return prev;
+      return [newAudio, ...prev];
+    });
+  };
+
+  const handleDeleteBeacon = async (beaconId) => {
+    try {
+      await api.audio.delete(beaconId);
+      setBeacons((prev) => prev.filter((b) => (b.id || b._id) !== beaconId));
+    } catch (err) {
+      console.error("Failed to delete beacon:", err);
+    }
+  };
+
+  // WebRTC Audio Toggles
+  const handleToggleMute = () => {
+    const muted = webrtc.toggleMute();
+    setIsMuted(muted);
+  };
+
+  const handleToggleDeafen = () => {
+    const deafened = webrtc.toggleDeafen();
+    setIsDeafened(deafened);
+  };
+
+  const handleToggleSpatial = () => {
+    const nextSpatial = !isSpatialAudio;
+    setIsSpatialAudio(nextSpatial);
+    spatialMixer.setSpatialEnabled(nextSpatial);
+  };
+
+  const handleToggleOcclusion = () => {
+    const nextOcclusion = !isOcclusionEnabled;
+    setIsOcclusionEnabled(nextOcclusion);
+    spatialMixer.setOcclusionEnabled(nextOcclusion);
+  };
+
   return (
-    <main className="app">
-      <header className="hero">
-        <p className="eyebrow">VIRTUAL COLLABORATION PLATFORM</p>
-        <h1>ProxiSpeak</h1>
-        <p>Move around your virtual office and meet other users.</p>
-      </header>
+    <div className="proxispeak-app corporate-app">
+      {/* Top Navigation */}
+      <Navbar
+        onOpenAuth={() => setIsAuthOpen(true)}
+        liveUsersCount={liveUsersCount}
+        isLiveTracking={isLiveTracking}
+        onToggleLiveTracking={() => setIsLiveTracking(!isLiveTracking)}
+        onOpenBroadcast={() => setIsBroadcastOpen(true)}
+      />
 
-      <section className="office">
-        <div className="office-title">
-          <div>
-            <h2>Virtual Office</h2>
-            <p>Real-time multiplayer environment</p>
-          </div>
-
-          <span className={connection === "Connected" ? "online" : "offline"}>
-            ● {connection}
-          </span>
-        </div>
-
-        {connectionError && (
-          <p className="connection-error">
-            Connection detail: {connectionError}
-          </p>
-        )}
-
-        <div className="canvas-container">
-          <canvas
-            ref={canvasRef}
-            width={WIDTH}
-            height={HEIGHT}
-            aria-label="ProxiSpeak virtual office"
+      {/* Main Workspace (60 FPS Canvas + Live Proximity Coworkers Panel) */}
+      <main className="main-workspace corporate-workspace">
+        {/* Left Side: 60 FPS HTML5 Canvas Virtual World */}
+        <section className="map-panel canvas-panel-container">
+          <OfficeCanvas
+            userPos={officePos}
+            targetPos={targetPos}
+            onUserMove={handleUserMove}
+            radius={radius}
+            livePeers={livePeers}
+            beacons={beacons}
+            isSpeaking={isSpeaking}
+            isMuted={isMuted}
+            isDeafened={isDeafened}
+            isSpatialAudio={isSpatialAudio}
+            onToggleMute={handleToggleMute}
+            onToggleDeafen={handleToggleDeafen}
+            onToggleSpatial={handleToggleSpatial}
           />
-        </div>
-
-        <div className="stats">
-          <span>Connected users: {userCount}</span>
-          <span>X: {coordinates.x}</span>
-          <span>Y: {coordinates.y}</span>
-          <span>Hearing radius: {HEARING_RADIUS} px</span>
-        </div>
-
-        {/* Proximity Detection panel */}
-        <section className="proximity-panel">
-          <h3>Proximity Detection</h3>
-
-          {nearbyUsers.length === 0 ? (
-            <p>No users within your 100-pixel hearing radius.</p>
-          ) : (
-            <ul>
-              {nearbyUsers.map((user) => (
-                <li key={user.id}>
-                  <span className="nearby-indicator">●</span>{" "}
-                  {user.name} — {user.distance} pixels away
-                </li>
-              ))}
-            </ul>
-          )}
         </section>
 
-        <p className="instructions">
-          Use arrow keys or W, A, S, D to move your avatar.
-          Open a second browser window to test multiplayer.
-        </p>
-      </section>
-    </main>
+        {/* Right Side: Infotact Coworkers & Spatial Radar Panel */}
+        <section className="feed-panel corporate-feed-panel">
+          <CoworkersPanel
+            livePeers={livePeers}
+            beacons={beacons}
+            userPos={officePos}
+            radius={radius}
+            onChangeRadius={setRadius}
+            onNavigateToZone={(zone) => setTargetPos({ x: zone.x, y: zone.y })}
+            onWalkToPeer={(pos) => setTargetPos({ x: pos.x, y: pos.y })}
+            onOpenBroadcast={() => setIsBroadcastOpen(true)}
+            onDeleteBeacon={handleDeleteBeacon}
+            isSpatialAudio={isSpatialAudio}
+            isOcclusionEnabled={isOcclusionEnabled}
+            onToggleSpatial={handleToggleSpatial}
+            onToggleOcclusion={handleToggleOcclusion}
+          />
+        </section>
+      </main>
+
+      {/* Spatial Audio Broadcast Modal */}
+      <AudioBroadcastModal
+        isOpen={isBroadcastOpen}
+        onClose={() => setIsBroadcastOpen(false)}
+        userPos={officePos}
+        onBroadcastCreated={handleBroadcastCreated}
+        onOpenAuth={() => {
+          setIsBroadcastOpen(false);
+          setIsAuthOpen(true);
+        }}
+      />
+
+      {/* Auth Modal */}
+      <AuthModal
+        isOpen={isAuthOpen}
+        onClose={() => setIsAuthOpen(false)}
+      />
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <ProxiSpeakMain />
+    </AuthProvider>
   );
 }
 

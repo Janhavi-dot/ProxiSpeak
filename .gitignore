@@ -2,3 +2,6 @@
 server/.env
 node_modules/
 **/node_modules/
+server/uploads/audio/*
+!server/uploads/audio/.gitkeep
+dist/

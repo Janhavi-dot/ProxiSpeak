@@ -1,213 +1,157 @@
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { createServer } from "node:http";
 import { Server } from "socket.io";
-import { MongoClient } from "mongodb";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { connectDatabase, closeDatabase, getDb } from "./src/config/database.js";
+import { setupProximitySocket } from "./src/sockets/proximitySocket.js";
+import authRoutes from "./src/routes/authRoutes.js";
+import audioRoutes from "./src/routes/audioRoutes.js";
+import userRoutes from "./src/routes/userRoutes.js";
+import officeRoutes from "./src/routes/officeRoutes.js";
+import { errorHandler, notFoundHandler } from "./src/middleware/errorHandler.js";
+import { apiLimiter } from "./src/middleware/rateLimiter.js";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const httpServer = createServer(app);
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json());
+// Permissive CORS for development across common local ports
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:5174",
+  "http://127.0.0.1:5174",
+  "http://localhost:5182",
+  "http://127.0.0.1:5182",
+  "http://localhost:3000",
+];
 
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g. mobile apps, curl, postman)
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(null, true); // Allow dev origins dynamically
+      }
+    },
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+
+// Serve uploaded audio files statically
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+// Socket.IO configuration
 const io = new Server(httpServer, {
   cors: {
-    origin: [
-      "http://localhost:5173",
-      "http://127.0.0.1:5173",
-      "http://localhost:5182",
-      "http://127.0.0.1:5182",
-    ],
+    origin: "*",
     methods: ["GET", "POST"],
   },
 });
 
-const MONGODB_URI = process.env.MONGODB_URI;
-const users = new Map();
+// Attach io to express app for controller access
+app.set("io", io);
 
-let mongoClient;
-let positionsCollection;
+// General rate limiter on API
+app.use("/api", apiLimiter);
 
-app.get("/", (req, res) => {
-  res.send("Welcome to ProxiSpeak Backend!");
-});
-
+// System health check
 app.get("/api/health", (req, res) => {
+  let dbStatus = "disconnected";
+  try {
+    if (getDb()) dbStatus = "connected";
+  } catch (e) {
+    dbStatus = "disconnected";
+  }
+
   res.json({
     success: true,
     project: "ProxiSpeak",
-    message: "Backend is running successfully",
-    database: positionsCollection ? "connected" : "disconnected",
+    name: "Geospatial Proximity Audio Ecosystem",
+    version: "2.0.0",
+    status: "healthy",
+    database: dbStatus,
+    timestamp: new Date().toISOString(),
   });
 });
 
-// Save a user's virtual-office position in MongoDB.
-async function savePosition(user) {
-  await positionsCollection.updateOne(
-    { _id: user.id },
-    {
-      $set: {
-        name: user.name,
-        position: [user.x, user.y],
-        updatedAt: new Date(),
-      },
+// Root welcome message
+app.get("/", (req, res) => {
+  res.json({
+    project: "ProxiSpeak API",
+    description: "Geospatial Proximity Audio Ecosystem Backend",
+    endpoints: {
+      health: "/api/health",
+      auth: "/api/auth",
+      audio: "/api/audio",
+      users: "/api/users",
     },
-    { upsert: true }
-  );
-}
-
-// Find users within the 100-pixel hearing radius.
-async function updateProximity(user) {
-  const nearbyUsers = await positionsCollection
-    .find({
-      _id: { $ne: user.id },
-      position: {
-        $near: [user.x, user.y],
-        $maxDistance: 100,
-      },
-    })
-    .toArray();
-
-  io.to(user.id).emit(
-    "proximity:update",
-    nearbyUsers.map((other) => ({
-      id: other._id,
-      name: other.name,
-      distance: Math.round(
-        Math.hypot(
-          user.x - other.position[0],
-          user.y - other.position[1]
-        )
-      ),
-    }))
-  );
-}
-
-// Refresh proximity information for every connected user.
-async function refreshAllProximity() {
-  for (const user of users.values()) {
-    try {
-      await updateProximity(user);
-    } catch (error) {
-      console.error(
-        `Proximity update failed for ${user.name}:`,
-        error.message
-      );
-    }
-  }
-}
-
-io.on("connection", (socket) => {
-  const user = {
-    id: socket.id,
-    name: `User-${socket.id.slice(0, 4)}`,
-    x: 180,
-    y: 180,
-  };
-
-  users.set(socket.id, user);
-
-  console.log(`Connected: ${user.name} (${socket.id})`);
-
-  socket.emit("users:update", Array.from(users.values()));
-  socket.broadcast.emit("user:joined", user);
-
-  // Persist the initial position.
-  savePosition(user)
-    .then(refreshAllProximity)
-    .catch((error) => {
-      console.error("Could not save initial position:", error.message);
-    });
-
-  socket.on("player:move", async (position) => {
-    if (
-      !position ||
-      !Number.isFinite(position.x) ||
-      !Number.isFinite(position.y)
-    ) {
-      return;
-    }
-
-    user.x = Math.max(16, Math.min(884, position.x));
-    user.y = Math.max(16, Math.min(484, position.y));
-
-    // Broadcast movement to other connected users.
-    socket.broadcast.emit("player:moved", {
-      id: socket.id,
-      x: user.x,
-      y: user.y,
-    });
-
-    try {
-      await savePosition(user);
-      await refreshAllProximity();
-    } catch (error) {
-      console.error("Could not update user position:", error.message);
-    }
-  });
-
-  socket.on("disconnect", async (reason) => {
-    users.delete(socket.id);
-
-    try {
-      await positionsCollection.deleteOne({ _id: socket.id });
-      await refreshAllProximity();
-    } catch (error) {
-      console.error("Could not remove disconnected user:", error.message);
-    }
-
-    io.emit("user:left", socket.id);
-
-    console.log(`Disconnected: ${user.name}; reason: ${reason}`);
   });
 });
 
+// Mount modular API routes
+app.use("/api/auth", authRoutes);
+app.use("/api/audio", audioRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/office", officeRoutes);
+
+// 404 & Centralized Error Handlers
+app.use(notFoundHandler);
+app.use(errorHandler);
+
+// Setup Socket.IO real-time proximity presence
+setupProximitySocket(io);
+
+// Start Server and Database Connection
 async function startServer() {
-  if (!MONGODB_URI) {
-    console.error("MONGODB_URI is missing from your server .env file.");
-    process.exitCode = 1;
-    return;
-  }
-
   try {
-    mongoClient = new MongoClient(MONGODB_URI);
-    await mongoClient.connect();
-
-    const database = mongoClient.db("proxispeak");
-    positionsCollection = database.collection("user_positions");
-
-    // The virtual office uses planar canvas coordinates.
-    // MongoDB's 2d index is appropriate for this coordinate system.
-    const existingIndexes = await positionsCollection.indexes();
-
-const positionIndex = existingIndexes.find(
-  (index) => index.name === "position_2d"
-);
-
-if (positionIndex) {
-  await positionsCollection.dropIndex("position_2d");
-}
-
-await positionsCollection.createIndex(
-  { position: "2d" },
-  { min: 0, max: 900 }
-);
-    
-
-    console.log("MongoDB connected successfully.");
+    await connectDatabase();
 
     httpServer.listen(PORT, () => {
-      console.log(`ProxiSpeak backend running at http://localhost:${PORT}`);
+      console.log(`===============================================`);
+      console.log(`🎙️  ProxiSpeak Geospatial Audio Ecosystem API`);
+      console.log(`🚀 Running at http://localhost:${PORT}`);
+      console.log(`📡 Health Check: http://localhost:${PORT}/api/health`);
+      console.log(`===============================================`);
     });
   } catch (error) {
-    console.error("Could not start ProxiSpeak:", error.message);
-    process.exitCode = 1;
+    console.error("Critical: Could not start ProxiSpeak server:", error.message);
+    process.exit(1);
   }
 }
 
+// Graceful shutdown
+async function gracefulShutdown(signal) {
+  console.log(`\nReceived ${signal}. Shutting down ProxiSpeak server gracefully...`);
+  httpServer.close(async () => {
+    try {
+      await closeDatabase();
+      console.log("Database connections closed. Goodbye!");
+      process.exit(0);
+    } catch (err) {
+      console.error("Error during graceful shutdown:", err.message);
+      process.exit(1);
+    }
+  });
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
 startServer();
+
+export { app, httpServer };
