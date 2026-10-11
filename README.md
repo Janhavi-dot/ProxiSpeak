@@ -119,4 +119,3 @@ The endpoint should report that the backend is running and indicate the database
 ## 📄 License
 
 Add a license if you intend to distribute or reuse the project publicly.
-﻿# ProxiSpeak
