@@ -1,309 +1,897 @@
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import "./App.css";
+
+const API_URL = "http://localhost:5000";
 
 const WIDTH = 900;
 const HEIGHT = 500;
 const SPEED = 3;
-const API_URL = "http://localhost:5000";
 const HEARING_RADIUS = 100;
+const PLAYER_RADIUS = 13;
 
-function App() {
+// Desk positions
+const DESKS = [
+  [70, 75],
+  [230, 75],
+  [70, 200],
+  [230, 200],
+  [70, 325],
+  [230, 325],
+  [480, 220],
+  [480, 325],
+];
+
+const DESK_WIDTH = 95;
+const DESK_HEIGHT = 48;
+
+// Meeting room
+const ROOM = {
+  left: 640,
+  top: 35,
+  right: 860,
+  bottom: 160,
+};
+
+// Doorway in the bottom wall
+const DOORWAY = {
+  left: 720,
+  right: 780,
+};
+
+const WALL_THICKNESS = 6;
+
+const ROOM_WALLS = [
+  [ROOM.left, ROOM.top, ROOM.right, ROOM.top],
+  [ROOM.left, ROOM.top, ROOM.left, ROOM.bottom],
+  [ROOM.right, ROOM.top, ROOM.right, ROOM.bottom],
+  [ROOM.left, ROOM.bottom, DOORWAY.left, ROOM.bottom],
+  [DOORWAY.right, ROOM.bottom, ROOM.right, ROOM.bottom],
+];
+
+const clamp = (value, min, max) =>
+  Math.max(min, Math.min(max, value));
+
+// Check collision between a player and a wall segment
+const pointHitsSegment = (x, y, x1, y1, x2, y2, radius) => {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lengthSquared = dx * dx + dy * dy;
+
+  const t =
+    lengthSquared === 0
+      ? 0
+      : clamp(
+          ((x - x1) * dx + (y - y1) * dy) / lengthSquared,
+          0,
+          1
+        );
+
+  const closestX = x1 + t * dx;
+  const closestY = y1 + t * dy;
+  const distanceX = x - closestX;
+  const distanceY = y - closestY;
+  const collisionRadius = radius + WALL_THICKNESS / 2;
+
+  return (
+    distanceX * distanceX + distanceY * distanceY <
+    collisionRadius * collisionRadius
+  );
+};
+
+// Check desk and meeting-room wall collisions
+const collidesWithObstacle = (x, y) => {
+  const hitsDesk = DESKS.some(([deskX, deskY]) => {
+    const closestX = clamp(x, deskX, deskX + DESK_WIDTH);
+    const closestY = clamp(y, deskY, deskY + DESK_HEIGHT);
+    const dx = x - closestX;
+    const dy = y - closestY;
+
+    return dx * dx + dy * dy < PLAYER_RADIUS * PLAYER_RADIUS;
+  });
+
+  const hitsRoomWall = ROOM_WALLS.some(([x1, y1, x2, y2]) =>
+    pointHitsSegment(
+      x,
+      y,
+      x1,
+      y1,
+      x2,
+      y2,
+      PLAYER_RADIUS
+    )
+  );
+
+  return hitsDesk || hitsRoomWall;
+};
+
+export default function App() {
   const canvasRef = useRef(null);
-  const position = useRef({ x: 180, y: 180 });
-  const keys = useRef({});
-  const remoteUsers = useRef(new Map());
+  const socketRef = useRef(null);
+  const localStreamRef = useRef(null);
 
-  const [connection, setConnection] = useState("Connecting...");
-  const [connectionError, setConnectionError] = useState("");
-  const [userCount, setUserCount] = useState(1);
-  const [coordinates, setCoordinates] = useState({ x: 180, y: 180 });
+  const peerConnectionsRef = useRef(new Map());
+  const audioElementsRef = useRef(new Map());
+  const audioNodesRef = useRef(new Map());
+  const voiceReadyIdsRef = useRef(new Set());
+  const positionsRef = useRef(new Map());
+
+  const playerRef = useRef({ x: 180, y: 180 });
+  const keysRef = useRef(new Set());
+  const localIdRef = useRef(null);
+
+  const [player, setPlayer] = useState({ x: 180, y: 180 });
+  const [users, setUsers] = useState([]);
   const [nearbyUsers, setNearbyUsers] = useState([]);
+  const [voiceOn, setVoiceOn] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState("Voice is off");
+  const [error, setError] = useState("");
 
-  useEffect(() => {
-    const socket = io(API_URL, {
-      transports: ["websocket", "polling"],
-      reconnection: true,
-      reconnectionAttempts: 10,
-      reconnectionDelay: 1000,
-      timeout: 10000,
+  // Update player position and send it to the server
+  const updatePosition = useCallback((next) => {
+    playerRef.current = next;
+    setPlayer(next);
+
+    const id = localIdRef.current;
+
+    if (id) {
+      positionsRef.current.set(id, next);
+    }
+
+    socketRef.current?.emit("player:move", next);
+  }, []);
+
+  // Clean up remote audio
+  const cleanupPeerAudio = useCallback((peerId) => {
+    const audio = audioElementsRef.current.get(peerId);
+
+    if (audio) {
+      audio.pause();
+      audio.srcObject = null;
+      audioElementsRef.current.delete(peerId);
+    }
+
+    const nodes = audioNodesRef.current.get(peerId);
+
+    if (nodes) {
+      try {
+        nodes.source.disconnect();
+        nodes.panner.disconnect();
+        nodes.gain.disconnect();
+      } catch {
+        // Nodes may already be disconnected.
+      }
+
+      nodes.audioContext.close().catch(() => {});
+      audioNodesRef.current.delete(peerId);
+    }
+  }, []);
+
+  // Create a WebRTC connection
+  const createPeerConnection = useCallback((peerId) => {
+    const existing = peerConnectionsRef.current.get(peerId);
+
+    if (existing) return existing;
+
+    const socket = socketRef.current;
+
+    if (!socket || !localStreamRef.current) {
+      return null;
+    }
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+      ],
     });
 
-    socket.on("connect", () => {
-      console.log("Socket.io connected:", socket.id);
-      setConnection("Connected");
-      setConnectionError("");
+    localStreamRef.current.getTracks().forEach((track) => {
+      pc.addTrack(track, localStreamRef.current);
     });
 
-    socket.on("connect_error", (error) => {
-      console.error("Socket.io connection error:", error.message);
-      setConnection("Connection failed");
-      setConnectionError(error.message);
-    });
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit("webrtc:ice-candidate", {
+          to: peerId,
+          candidate: event.candidate,
+        });
+      }
+    };
 
-    socket.on("disconnect", (reason) => {
-      console.warn("Socket.io disconnected:", reason);
-      setConnection("Disconnected");
-    });
+    // FIXED REMOTE AUDIO CONNECTION
+    pc.ontrack = (event) => {
+      if (event.track.kind !== "audio") return;
 
-    socket.on("users:update", (users) => {
-      remoteUsers.current.clear();
+      const remoteStream = event.streams[0];
 
-      users.forEach((user) => {
-        if (user.id !== socket.id) {
-          remoteUsers.current.set(user.id, user);
-        }
+      if (!remoteStream) {
+        console.error("No remote audio stream received.");
+        return;
+      }
+
+      let nodes = audioNodesRef.current.get(peerId);
+
+      if (!nodes) {
+        const audioContext = new AudioContext();
+
+        const source =
+          audioContext.createMediaStreamSource(remoteStream);
+
+        const panner = audioContext.createStereoPanner();
+        const gain = audioContext.createGain();
+
+        // Initial volume; proximity logic adjusts it.
+        gain.gain.value = 1;
+
+        source.connect(panner);
+        panner.connect(gain);
+        gain.connect(audioContext.destination);
+
+        nodes = {
+          audioContext,
+          source,
+          panner,
+          gain,
+        };
+
+        audioNodesRef.current.set(peerId, nodes);
+      }
+
+      // Create a separate audio element for tracking/cleanup.
+      // Actual playback is through the Web Audio graph above.
+      let audio = audioElementsRef.current.get(peerId);
+
+      if (!audio) {
+        audio = new Audio();
+        audio.autoplay = true;
+        audio.playsInline = true;
+        audio.volume = 1;
+
+        audioElementsRef.current.set(peerId, audio);
+      }
+
+      nodes.audioContext.resume().catch((err) => {
+        console.error("Could not start audio playback:", err);
       });
 
-      setUserCount(remoteUsers.current.size + 1);
+      setVoiceStatus("Remote audio stream received.");
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "failed") {
+        setVoiceStatus(
+          "Voice connection failed. Check your network."
+        );
+      }
+    };
+
+    peerConnectionsRef.current.set(peerId, pc);
+
+    return pc;
+  }, []);
+
+  // Connect to another user who has enabled voice
+  const connectToReadyPeer = useCallback(async (peerId) => {
+    const socket = socketRef.current;
+    const localId = localIdRef.current;
+
+    if (
+      !socket ||
+      !localId ||
+      !localStreamRef.current ||
+      !voiceReadyIdsRef.current.has(peerId)
+    ) {
+      return;
+    }
+
+    const pc = createPeerConnection(peerId);
+
+    if (!pc) return;
+
+    // Only one peer creates the offer.
+    if (
+      localId.localeCompare(peerId) < 0 &&
+      !pc.localDescription
+    ) {
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        socket.emit("webrtc:offer", {
+          to: peerId,
+          description: pc.localDescription,
+        });
+      } catch (err) {
+        console.error("Could not create WebRTC offer:", err);
+      }
+    }
+  }, [createPeerConnection]);
+
+  // Start microphone
+  const startVoice = async () => {
+    if (localStreamRef.current) return;
+
+    setError("");
+
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          "Microphone access requires localhost or HTTPS."
+        );
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+
+      localStreamRef.current = stream;
+
+      setVoiceOn(true);
+      setVoiceStatus(
+        "Microphone on. Waiting for nearby users with voice."
+      );
+
+      const socket = socketRef.current;
+
+      if (!socket) {
+        stream.getTracks().forEach((track) => track.stop());
+        localStreamRef.current = null;
+        setVoiceOn(false);
+
+        throw new Error(
+          "The ProxiSpeak server is not connected."
+        );
+      }
+
+      socket.emit("voice:ready");
+    } catch (err) {
+      setError(err.message || "Could not access the microphone.");
+      setVoiceStatus("Microphone unavailable");
+    }
+  };
+
+  // Stop microphone and close audio connections
+  const stopVoice = () => {
+    socketRef.current?.emit("voice:stop");
+
+    localStreamRef.current?.getTracks().forEach((track) => {
+      track.stop();
+    });
+
+    localStreamRef.current = null;
+
+    for (const pc of peerConnectionsRef.current.values()) {
+      pc.close();
+    }
+
+    peerConnectionsRef.current.clear();
+
+    for (const peerId of [...audioElementsRef.current.keys()]) {
+      cleanupPeerAudio(peerId);
+    }
+
+    voiceReadyIdsRef.current.clear();
+
+    setVoiceOn(false);
+    setVoiceStatus("Voice is off");
+  };
+
+  // Socket.IO and WebRTC event handling
+  useEffect(() => {
+    const socket = io(API_URL);
+    socketRef.current = socket;
+
+    socket.on("connect", () => {
+      localIdRef.current = socket.id;
+
+      positionsRef.current.set(
+        socket.id,
+        playerRef.current
+      );
+    });
+
+    socket.on("connect_error", (err) => {
+      setError(`Server connection failed: ${err.message}`);
+    });
+
+    socket.on("users:update", (list) => {
+      setUsers(list);
+
+      list.forEach((user) => {
+        positionsRef.current.set(user.id, {
+          x: user.x,
+          y: user.y,
+        });
+      });
     });
 
     socket.on("user:joined", (user) => {
-      if (user.id !== socket.id) {
-        remoteUsers.current.set(user.id, user);
-        setUserCount(remoteUsers.current.size + 1);
-      }
+      setUsers((previous) => [
+        ...previous.filter((item) => item.id !== user.id),
+        user,
+      ]);
+
+      positionsRef.current.set(user.id, {
+        x: user.x,
+        y: user.y,
+      });
     });
 
-    // Update other users' positions.
-    socket.on("player:moved", (data) => {
-      const user = remoteUsers.current.get(data.id);
+    socket.on("player:moved", ({ id, x, y }) => {
+      positionsRef.current.set(id, { x, y });
 
-      if (user) {
-        user.x = data.x;
-        user.y = data.y;
-      }
-    });
-
-    // Receive the list of nearby users from the backend.
-    socket.on("proximity:update", (users) => {
-      setNearbyUsers(users);
+      setUsers((previous) =>
+        previous.map((user) =>
+          user.id === id ? { ...user, x, y } : user
+        )
+      );
     });
 
     socket.on("user:left", (id) => {
-      remoteUsers.current.delete(id);
-      setUserCount(remoteUsers.current.size + 1);
+      setUsers((previous) =>
+        previous.filter((user) => user.id !== id)
+      );
+
+      positionsRef.current.delete(id);
+      voiceReadyIdsRef.current.delete(id);
+
+      peerConnectionsRef.current.get(id)?.close();
+      peerConnectionsRef.current.delete(id);
+
+      cleanupPeerAudio(id);
     });
 
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
+    socket.on("proximity:update", setNearbyUsers);
 
-    let animationId;
-    let lastPositionUpdate = 0;
-    let lastUIUpdate = 0;
+    socket.on("voice:ready-users", async (ids) => {
+      ids.forEach((id) => voiceReadyIdsRef.current.add(id));
 
-    function handleKeyDown(event) {
+      for (const id of ids) {
+        await connectToReadyPeer(id);
+      }
+    });
+
+    socket.on("voice:user-ready", async ({ id }) => {
+      voiceReadyIdsRef.current.add(id);
+      await connectToReadyPeer(id);
+    });
+
+    socket.on("voice:user-stopped", ({ id }) => {
+      voiceReadyIdsRef.current.delete(id);
+
+      peerConnectionsRef.current.get(id)?.close();
+      peerConnectionsRef.current.delete(id);
+
+      cleanupPeerAudio(id);
+    });
+
+    socket.on("webrtc:offer", async ({ from, description }) => {
+      if (
+        !localStreamRef.current ||
+        !voiceReadyIdsRef.current.has(from)
+      ) {
+        return;
+      }
+
+      try {
+        const pc = createPeerConnection(from);
+
+        if (!pc) return;
+
+        await pc.setRemoteDescription(description);
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        socket.emit("webrtc:answer", {
+          to: from,
+          description: pc.localDescription,
+        });
+      } catch (err) {
+        console.error("Could not handle WebRTC offer:", err);
+      }
+    });
+
+    socket.on("webrtc:answer", async ({ from, description }) => {
+      const pc = peerConnectionsRef.current.get(from);
+
+      if (!pc) return;
+
+      try {
+        await pc.setRemoteDescription(description);
+      } catch (err) {
+        console.error("Could not handle WebRTC answer:", err);
+      }
+    });
+
+    socket.on(
+      "webrtc:ice-candidate",
+      async ({ from, candidate }) => {
+        const pc = peerConnectionsRef.current.get(from);
+
+        if (!pc || !candidate) return;
+
+        try {
+          await pc.addIceCandidate(candidate);
+        } catch (err) {
+          console.error("Could not add ICE candidate:", err);
+        }
+      }
+    );
+
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+
+      localStreamRef.current?.getTracks().forEach((track) => {
+        track.stop();
+      });
+
+      localStreamRef.current = null;
+
+      peerConnectionsRef.current.forEach((pc) => pc.close());
+      peerConnectionsRef.current.clear();
+
+      for (const peerId of [...audioElementsRef.current.keys()]) {
+        cleanupPeerAudio(peerId);
+      }
+    };
+  }, [
+    connectToReadyPeer,
+    createPeerConnection,
+    cleanupPeerAudio,
+  ]);
+
+  // Keyboard movement and collision detection
+  useEffect(() => {
+    const onKeyDown = (event) => {
       const key = event.key.toLowerCase();
 
       if (
-        ["arrowup", "arrowdown", "arrowleft", "arrowright",
-          "w", "a", "s", "d"].includes(key)
+        [
+          "arrowup",
+          "arrowdown",
+          "arrowleft",
+          "arrowright",
+          "w",
+          "a",
+          "s",
+          "d",
+        ].includes(key)
       ) {
         event.preventDefault();
-        keys.current[key] = true;
+        keysRef.current.add(key);
       }
-    }
+    };
 
-    function handleKeyUp(event) {
-      keys.current[event.key.toLowerCase()] = false;
-    }
+    const onKeyUp = (event) => {
+      keysRef.current.delete(event.key.toLowerCase());
+    };
 
-    function drawDesk(x, y, label) {
-      ctx.fillStyle = "#cbd5e1";
-      ctx.fillRect(x, y, 120, 55);
+    const onBlur = () => keysRef.current.clear();
 
-      ctx.fillStyle = "#475569";
-      ctx.font = "13px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText(label, x + 60, y + 32);
-    }
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
 
-    function drawAvatar(x, y, name, color) {
-      ctx.beginPath();
-      ctx.arc(x, y, 16, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
+    let frame;
 
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = "#ffffff";
-      ctx.stroke();
+    const move = () => {
+      const keys = keysRef.current;
+      const current = playerRef.current;
 
-      ctx.fillStyle = "#172033";
-      ctx.font = "bold 12px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText(name, x, y - 25);
-    }
+      let dx = 0;
+      let dy = 0;
 
-    function drawOffice() {
-      const p = position.current;
-      const k = keys.current;
+      if (keys.has("arrowup") || keys.has("w")) dy -= SPEED;
+      if (keys.has("arrowdown") || keys.has("s")) dy += SPEED;
+      if (keys.has("arrowleft") || keys.has("a")) dx -= SPEED;
+      if (keys.has("arrowright") || keys.has("d")) dx += SPEED;
 
-      if (k.arrowup || k.w) p.y -= SPEED;
-      if (k.arrowdown || k.s) p.y += SPEED;
-      if (k.arrowleft || k.a) p.x -= SPEED;
-      if (k.arrowright || k.d) p.x += SPEED;
+      // Normalize diagonal movement
+      if (dx !== 0 && dy !== 0) {
+        dx *= Math.SQRT1_2;
+        dy *= Math.SQRT1_2;
+      }
 
-      p.x = Math.max(20, Math.min(WIDTH - 20, p.x));
-      p.y = Math.max(20, Math.min(HEIGHT - 20, p.y));
+      const nextX = clamp(
+        current.x + dx,
+        PLAYER_RADIUS + 8,
+        WIDTH - PLAYER_RADIUS - 8
+      );
 
-      // Office floor and grid.
+      const nextY = clamp(
+        current.y + dy,
+        PLAYER_RADIUS + 8,
+        HEIGHT - PLAYER_RADIUS - 8
+      );
+
+      // Check axes independently so players can slide along obstacles
+      const canMoveX = !collidesWithObstacle(nextX, current.y);
+      const canMoveY = !collidesWithObstacle(current.x, nextY);
+
+      const next = {
+        x: canMoveX ? nextX : current.x,
+        y: canMoveY ? nextY : current.y,
+      };
+
+      if (next.x !== current.x || next.y !== current.y) {
+        updatePosition(next);
+      }
+
+      frame = requestAnimationFrame(move);
+    };
+
+    frame = requestAnimationFrame(move);
+
+    return () => {
+      cancelAnimationFrame(frame);
+
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [updatePosition]);
+
+  // Draw office and update audio volume and stereo position
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    let frame;
+
+    const draw = () => {
+      ctx.clearRect(0, 0, WIDTH, HEIGHT);
+
+      // Office background
       ctx.fillStyle = "#f8fafc";
       ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-      ctx.strokeStyle = "#e2e8f0";
+      // Outer office boundary
+      ctx.strokeStyle = "#cbd5e1";
+      ctx.lineWidth = 3;
+      ctx.strokeRect(8, 8, WIDTH - 16, HEIGHT - 16);
+
+      // Meeting-room floor
+      ctx.fillStyle = "#e0f2fe";
+      ctx.fillRect(
+        ROOM.left,
+        ROOM.top,
+        ROOM.right - ROOM.left,
+        ROOM.bottom - ROOM.top
+      );
+
+      // Meeting-room walls with an open doorway
+      ctx.strokeStyle = "#0284c7";
+      ctx.lineWidth = WALL_THICKNESS;
+      ctx.lineCap = "square";
+
+      ROOM_WALLS.forEach(([x1, y1, x2, y2]) => {
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+      });
+
       ctx.lineWidth = 1;
+      ctx.lineCap = "butt";
 
-      for (let x = 0; x <= WIDTH; x += 40) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, HEIGHT);
-        ctx.stroke();
-      }
+      // Meeting-room labels
+      ctx.fillStyle = "#075985";
+      ctx.font = "bold 15px Arial";
+      ctx.fillText("Meeting Room", 690, 58);
 
-      for (let y = 0; y <= HEIGHT; y += 40) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(WIDTH, y);
-        ctx.stroke();
-      }
+      ctx.font = "11px Arial";
+      ctx.fillText(
+        "Doorway",
+        DOORWAY.left + 4,
+        ROOM.bottom - 8
+      );
 
-      // Office desks.
-      drawDesk(60, 60, "Desk 1");
-      drawDesk(350, 60, "Desk 2");
-      drawDesk(650, 60, "Desk 3");
-      drawDesk(60, 380, "Desk 4");
-      drawDesk(650, 380, "Desk 5");
+      // Draw desks
+      DESKS.forEach(([x, y]) => {
+        ctx.fillStyle = "#d6b58c";
+        ctx.fillRect(x, y, DESK_WIDTH, DESK_HEIGHT);
 
-      // Meeting area.
-      ctx.fillStyle = "#d1fae5";
-      ctx.fillRect(370, 350, 150, 70);
+        ctx.strokeStyle = "#9a7046";
+        ctx.strokeRect(x, y, DESK_WIDTH, DESK_HEIGHT);
 
-      ctx.fillStyle = "#065f46";
-      ctx.font = "13px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText("Meeting Area", 445, 390);
+        ctx.fillStyle = "#64748b";
+        ctx.fillRect(x + 34, y + 7, 28, 20);
+      });
 
-      // Hearing radius.
+      const local = playerRef.current;
+
+      const allPlayers = users.filter(
+        (user) => user.id !== localIdRef.current
+      );
+
+      // Distance-based audio and stereo panning
+      audioNodesRef.current.forEach((nodes, id) => {
+        const remote = positionsRef.current.get(id);
+
+        if (!remote || !localStreamRef.current) {
+          nodes.gain.gain.setTargetAtTime(
+            0,
+            nodes.audioContext.currentTime,
+            0.08
+          );
+          return;
+        }
+
+        const dx = remote.x - local.x;
+        const dy = remote.y - local.y;
+        const distance = Math.hypot(dx, dy);
+
+        const withinRange = distance < HEARING_RADIUS;
+
+        const volume = withinRange
+          ? Math.max(0, 1 - distance / HEARING_RADIUS)
+          : 0;
+
+        const pan = withinRange
+          ? Math.max(-1, Math.min(1, dx / HEARING_RADIUS))
+          : 0;
+
+        nodes.gain.gain.setTargetAtTime(
+          volume,
+          nodes.audioContext.currentTime,
+          0.08
+        );
+
+        nodes.panner.pan.setTargetAtTime(
+          pan,
+          nodes.audioContext.currentTime,
+          0.08
+        );
+      });
+
+      // Local hearing-radius circle
       ctx.beginPath();
-      ctx.arc(p.x, p.y, HEARING_RADIUS, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(79, 70, 229, 0.08)";
+      ctx.arc(
+        local.x,
+        local.y,
+        HEARING_RADIUS,
+        0,
+        Math.PI * 2
+      );
+
+      ctx.fillStyle = "rgba(34, 197, 94, 0.08)";
       ctx.fill();
 
-      ctx.strokeStyle = "#818cf8";
+      ctx.strokeStyle = "#22c55e";
       ctx.setLineDash([6, 5]);
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Other users.
-      for (const user of remoteUsers.current.values()) {
-        drawAvatar(user.x, user.y, user.name, "#0d9488");
-      }
+      // Other connected users
+      allPlayers.forEach((user) => {
+        const position =
+          positionsRef.current.get(user.id) || user;
 
-      // Your avatar.
-      drawAvatar(p.x, p.y, "You", "#4f46e5");
+        ctx.beginPath();
+        ctx.arc(position.x, position.y, 12, 0, Math.PI * 2);
 
-      const now = performance.now();
+        ctx.fillStyle = "#f97316";
+        ctx.fill();
 
-      // Send your position to the backend.
-      if (socket.connected && now - lastPositionUpdate >= 50) {
-        socket.emit("player:move", { x: p.x, y: p.y });
-        lastPositionUpdate = now;
-      }
+        ctx.fillStyle = "#7c2d12";
+        ctx.font = "12px Arial";
+        ctx.fillText(
+          user.name,
+          position.x - 25,
+          position.y - 18
+        );
+      });
 
-      // Update the displayed coordinates.
-      if (now - lastUIUpdate >= 100) {
-        setCoordinates({
-          x: Math.round(p.x),
-          y: Math.round(p.y),
-        });
+      // Local avatar
+      ctx.beginPath();
+      ctx.arc(
+        local.x,
+        local.y,
+        PLAYER_RADIUS,
+        0,
+        Math.PI * 2
+      );
 
-        lastUIUpdate = now;
-      }
+      ctx.fillStyle = "#2563eb";
+      ctx.fill();
 
-      animationId = requestAnimationFrame(drawOffice);
-    }
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 10px Arial";
+      ctx.fillText("YOU", local.x - 10, local.y + 4);
 
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-
-    drawOffice();
-
-    return () => {
-      cancelAnimationFrame(animationId);
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-      socket.disconnect();
+      frame = requestAnimationFrame(draw);
     };
-  }, []);
+
+    draw();
+
+    return () => cancelAnimationFrame(frame);
+  }, [users, player]);
 
   return (
     <main className="app">
-      <header className="hero">
-        <p className="eyebrow">VIRTUAL COLLABORATION PLATFORM</p>
+      <header className="app-header">
         <h1>ProxiSpeak</h1>
-        <p>Move around your virtual office and meet other users.</p>
+        <p>Proximity-based virtual office</p>
       </header>
 
-      <section className="office">
-        <div className="office-title">
-          <div>
-            <h2>Virtual Office</h2>
-            <p>Real-time multiplayer environment</p>
-          </div>
+      <section className="stats">
+        <span>
+          Connected users:{" "}
+          {users.length || (localIdRef.current ? 1 : 0)}
+        </span>
 
-          <span className={connection === "Connected" ? "online" : "offline"}>
-            ● {connection}
-          </span>
-        </div>
+        <span>
+          Position: X {Math.round(player.x)}, Y{" "}
+          {Math.round(player.y)}
+        </span>
 
-        {connectionError && (
-          <p className="connection-error">
-            Connection detail: {connectionError}
-          </p>
+        <span>Hearing radius: {HEARING_RADIUS}px</span>
+      </section>
+
+      <div className="office-wrap">
+        <canvas
+          ref={canvasRef}
+          width={WIDTH}
+          height={HEIGHT}
+          aria-label="ProxiSpeak virtual office"
+        />
+      </div>
+
+      <section className="voice-panel">
+        <h2>Voice Chat</h2>
+        <p>{voiceStatus}</p>
+
+        {!voiceOn ? (
+          <button onClick={startVoice}>Start Voice</button>
+        ) : (
+          <button
+            onClick={stopVoice}
+            className="stop-button"
+          >
+            Stop Voice
+          </button>
         )}
 
-        <div className="canvas-container">
-          <canvas
-            ref={canvasRef}
-            width={WIDTH}
-            height={HEIGHT}
-            aria-label="ProxiSpeak virtual office"
-          />
-        </div>
+        {error && (
+          <p className="error-message">{error}</p>
+        )}
 
-        <div className="stats">
-          <span>Connected users: {userCount}</span>
-          <span>X: {coordinates.x}</span>
-          <span>Y: {coordinates.y}</span>
-          <span>Hearing radius: {HEARING_RADIUS} px</span>
-        </div>
-
-        {/* Proximity Detection panel */}
-        <section className="proximity-panel">
-          <h3>Proximity Detection</h3>
-
-          {nearbyUsers.length === 0 ? (
-            <p>No users within your 100-pixel hearing radius.</p>
-          ) : (
-            <ul>
-              {nearbyUsers.map((user) => (
-                <li key={user.id}>
-                  <span className="nearby-indicator">●</span>{" "}
-                  {user.name} — {user.distance} pixels away
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-
-        <p className="instructions">
-          Use arrow keys or W, A, S, D to move your avatar.
-          Open a second browser window to test multiplayer.
+        <p className="help-text">
+          Keep your microphone enabled only when you want
+          to participate. Audio volume decreases with distance
+          and is muted beyond 100 pixels.
         </p>
       </section>
+
+      <section className="proximity-panel">
+        <h3>Proximity Detection</h3>
+
+        {nearbyUsers.length === 0 ? (
+          <p>No users within your 100-pixel hearing radius.</p>
+        ) : (
+          <ul>
+            {nearbyUsers.map((user) => (
+              <li key={user.id}>
+                <span className="nearby-indicator">●</span>{" "}
+                {user.name} — {user.distance} pixels away
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <p className="keyboard-help">
+        Move with arrow keys or W, A, S, D.
+      </p>
     </main>
   );
 }
-
-export default App;

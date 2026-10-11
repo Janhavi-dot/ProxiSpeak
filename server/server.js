@@ -29,6 +29,7 @@ const io = new Server(httpServer, {
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const users = new Map();
+const voiceReadyUsers = new Set();
 
 let mongoClient;
 let positionsCollection;
@@ -46,8 +47,9 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Save a user's virtual-office position in MongoDB.
 async function savePosition(user) {
+  if (!positionsCollection) return;
+
   await positionsCollection.updateOne(
     { _id: user.id },
     {
@@ -61,9 +63,10 @@ async function savePosition(user) {
   );
 }
 
-// Find users within the 100-pixel hearing radius.
 async function updateProximity(user) {
-  const nearbyUsers = await positionsCollection
+  if (!positionsCollection) return;
+
+  const nearby = await positionsCollection
     .find({
       _id: { $ne: user.id },
       position: {
@@ -75,7 +78,7 @@ async function updateProximity(user) {
 
   io.to(user.id).emit(
     "proximity:update",
-    nearbyUsers.map((other) => ({
+    nearby.map((other) => ({
       id: other._id,
       name: other.name,
       distance: Math.round(
@@ -88,18 +91,52 @@ async function updateProximity(user) {
   );
 }
 
-// Refresh proximity information for every connected user.
 async function refreshAllProximity() {
   for (const user of users.values()) {
     try {
       await updateProximity(user);
     } catch (error) {
-      console.error(
-        `Proximity update failed for ${user.name}:`,
-        error.message
-      );
+      console.error("Proximity update failed:", error.message);
     }
   }
+}
+
+// Relay WebRTC messages with explicit logs.
+function relaySignal(socket, eventName, payload) {
+  if (!payload || typeof payload.to !== "string" || !payload.to) {
+    console.warn(`[VOICE] Invalid ${eventName} payload from ${socket.id}`);
+    return;
+  }
+
+  if (!users.has(payload.to)) {
+    console.warn(
+      `[VOICE] Cannot relay ${eventName}: recipient is disconnected`,
+      payload.to
+    );
+    return;
+  }
+
+  const message = { from: socket.id };
+
+  if (eventName === "webrtc:offer" ||
+      eventName === "webrtc:answer") {
+    if (!payload.description) {
+      console.warn(`[VOICE] Missing description in ${eventName}`);
+      return;
+    }
+    message.description = payload.description;
+  }
+
+  if (eventName === "webrtc:ice-candidate") {
+    if (!payload.candidate) return;
+    message.candidate = payload.candidate;
+  }
+
+  console.log(
+    `[VOICE] Relaying ${eventName}: ${socket.id} -> ${payload.to}`
+  );
+
+  io.to(payload.to).emit(eventName, message);
 }
 
 io.on("connection", (socket) => {
@@ -112,12 +149,11 @@ io.on("connection", (socket) => {
 
   users.set(socket.id, user);
 
-  console.log(`Connected: ${user.name} (${socket.id})`);
+  console.log(`[SOCKET] Connected: ${user.name} (${socket.id})`);
 
   socket.emit("users:update", Array.from(users.values()));
   socket.broadcast.emit("user:joined", user);
 
-  // Persist the initial position.
   savePosition(user)
     .then(refreshAllProximity)
     .catch((error) => {
@@ -136,7 +172,6 @@ io.on("connection", (socket) => {
     user.x = Math.max(16, Math.min(884, position.x));
     user.y = Math.max(16, Math.min(484, position.y));
 
-    // Broadcast movement to other connected users.
     socket.broadcast.emit("player:moved", {
       id: socket.id,
       x: user.x,
@@ -151,25 +186,74 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Register this user as voice-ready before notifying peers.
+  socket.on("voice:ready", () => {
+    console.log("[VOICE] voice:ready received from", socket.id);
+    const alreadyReady = voiceReadyUsers.has(socket.id);
+
+    voiceReadyUsers.add(socket.id);
+
+    const otherReadyUsers = Array.from(voiceReadyUsers).filter(
+      (id) => id !== socket.id
+    );
+
+    console.log(
+      `[VOICE] ${socket.id} enabled voice. Ready peers: ${otherReadyUsers.length}`
+    );
+
+    socket.emit("voice:ready-users", otherReadyUsers);
+
+    if (!alreadyReady) {
+      socket.broadcast.emit("voice:user-ready", { id: socket.id });
+    }
+  });
+
+  socket.on("voice:stop", () => {
+    voiceReadyUsers.delete(socket.id);
+
+    console.log(`[VOICE] ${socket.id} stopped voice`);
+
+    socket.broadcast.emit("voice:user-stopped", { id: socket.id });
+  });
+
+  socket.on("webrtc:offer", (payload) => {
+    relaySignal(socket, "webrtc:offer", payload);
+  });
+
+  socket.on("webrtc:answer", (payload) => {
+    relaySignal(socket, "webrtc:answer", payload);
+  });
+
+  socket.on("webrtc:ice-candidate", (payload) => {
+    relaySignal(socket, "webrtc:ice-candidate", payload);
+  });
+
   socket.on("disconnect", async (reason) => {
     users.delete(socket.id);
+    voiceReadyUsers.delete(socket.id);
+
+    socket.broadcast.emit("voice:user-stopped", { id: socket.id });
 
     try {
-      await positionsCollection.deleteOne({ _id: socket.id });
+      if (positionsCollection) {
+        await positionsCollection.deleteOne({ _id: socket.id });
+      }
       await refreshAllProximity();
     } catch (error) {
-      console.error("Could not remove disconnected user:", error.message);
+      console.error("Disconnect cleanup failed:", error.message);
     }
 
     io.emit("user:left", socket.id);
 
-    console.log(`Disconnected: ${user.name}; reason: ${reason}`);
+    console.log(
+      `[SOCKET] Disconnected: ${user.name}; reason: ${reason}`
+    );
   });
 });
 
 async function startServer() {
   if (!MONGODB_URI) {
-    console.error("MONGODB_URI is missing from your server .env file.");
+    console.error("MONGODB_URI is missing from server .env");
     process.exitCode = 1;
     return;
   }
@@ -178,34 +262,50 @@ async function startServer() {
     mongoClient = new MongoClient(MONGODB_URI);
     await mongoClient.connect();
 
-    const database = mongoClient.db("proxispeak");
-    positionsCollection = database.collection("user_positions");
+    positionsCollection = mongoClient
+      .db("proxispeak")
+      .collection("user_positions");
 
-    // The virtual office uses planar canvas coordinates.
-    // MongoDB's 2d index is appropriate for this coordinate system.
-    const existingIndexes = await positionsCollection.indexes();
+      const indexes = await positionsCollection.indexes();
 
-const positionIndex = existingIndexes.find(
-  (index) => index.name === "position_2d"
-);
+      const positionIndex = indexes.find(
+        (index) =>
+          index.key?.position === "2d" &&
+          index.name !== "_id_"
+      );
+      
+      if (!positionIndex) {
+        await positionsCollection.createIndex(
+          { position: "2d" },
+          {
+            min: 0,
+            max: 900,
+            name: "position_2d",
+          }
+        );
+      
+        console.log("[DB] Created position_2d index.");
+      } else {
+        console.log(
+          "[DB] Position index already exists:",
+          positionIndex.name
+        );
+      }
 
-if (positionIndex) {
-  await positionsCollection.dropIndex("position_2d");
-}
+    console.log("[DB] MongoDB connected successfully.");
 
-await positionsCollection.createIndex(
-  { position: "2d" },
-  { min: 0, max: 900 }
-);
-    
-
-    console.log("MongoDB connected successfully.");
+    httpServer.on("error", (error) => {
+      console.error("[SERVER] Error:", error.message);
+    });
 
     httpServer.listen(PORT, () => {
-      console.log(`ProxiSpeak backend running at http://localhost:${PORT}`);
+      console.log(
+        `ProxiSpeak backend running at http://localhost:${PORT}`
+      );
     });
   } catch (error) {
     console.error("Could not start ProxiSpeak:", error.message);
+    await mongoClient?.close().catch(() => {});
     process.exitCode = 1;
   }
 }
